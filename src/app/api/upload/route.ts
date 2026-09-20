@@ -1,250 +1,353 @@
 import { NextResponse } from "next/server";
+import { parse } from "csv-parse/sync";
 import { prisma } from "../../../lib/prisma";
+import { getCheckStatus, latencyToMs } from "../../../lib";
+import { Severity } from "@prisma/client";
 
-export async function GET(request: Request) {
+type CSVRow = {
+  service_id?: string;
+  service_name?: string;
+  timestamp?: string;
+  status_code?: string;
+  latency?: string;
+  latency_unit?: string;
+  agent?: string;
+  region?: string;
+};
+
+export async function POST(request: Request) {
   try {
-    const { searchParams } = new URL(request.url);
+    const formData = await request.formData();
 
-    const from = searchParams.get("from");
-    const to = searchParams.get("to");
+    const file = formData.get("file");
 
-    const where: any = {};
-
-    if (from || to) {
-      where.timestamp = {};
-
-      if (from) {
-        const start = new Date(`${from}T00:00:00.000Z`);
-
-        if (Number.isNaN(start.getTime())) {
-          return NextResponse.json(
-            {
-              success: false,
-              error: "Invalid from date",
-            },
-            { status: 400 },
-          );
-        }
-
-        where.timestamp.gte = start;
-      }
-
-      if (to) {
-        const end = new Date(`${to}T23:59:59.999Z`);
-
-        if (Number.isNaN(end.getTime())) {
-          return NextResponse.json(
-            {
-              success: false,
-              error: "Invalid to date",
-            },
-            { status: 400 },
-          );
-        }
-
-        where.timestamp.lte = end;
-      }
-    }
-
-    const checks = await prisma.monitoringCheck.findMany({
-      where,
-
-      select: {
-        serviceId: true,
-        status: true,
-        latencyMs: true,
-
-        service: {
-          select: {
-            id: true,
-            name: true,
-          },
+    if (!(file instanceof File)) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "CSV file is required",
         },
-      },
-    });
+        { status: 400 },
+      );
+    }
 
-    const totalChecks = checks.length;
+    if (!file.name.endsWith(".csv")) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Only CSV files are supported",
+        },
+        { status: 400 },
+      );
+    }
 
-    const successfulChecks = checks.filter(
-      (check) => check.status === "UP",
-    ).length;
+    const csvText = await file.text();
 
-    const failedChecks = checks.filter(
-      (check) => check.status === "DOWN",
-    ).length;
+    if (!csvText.trim()) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "CSV file is empty",
+        },
+        { status: 400 },
+      );
+    }
 
-    const degradedChecks = checks.filter(
-      (check) => check.status === "DEGRADED",
-    ).length;
+    let rows: CSVRow[];
 
-    const unknownChecks = checks.filter(
-      (check) => check.status === "UNKNOWN",
-    ).length;
+    try {
+      rows = parse(csvText, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+        relax_column_count: true,
+      });
+    } catch {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Invalid CSV format",
+        },
+        { status: 400 },
+      );
+    }
 
-    const availability =
-      totalChecks > 0 ? (successfulChecks / totalChecks) * 100 : 0;
+    if (rows.length === 0) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "CSV contains no records",
+        },
+        { status: 400 },
+      );
+    }
 
-    const latencies = checks
-      .map((check) => check.latencyMs)
-      .filter(
-        (latency): latency is number =>
-          latency !== null && Number.isFinite(latency),
-      )
-      .sort((a, b) => a - b);
+    const validChecks = [];
+    const errors: string[] = [];
 
-    const averageLatency =
-      latencies.length > 0
-        ? latencies.reduce((sum, value) => sum + value, 0) / latencies.length
-        : 0;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
 
-    const p95Latency =
-      latencies.length > 0
-        ? latencies[Math.ceil(latencies.length * 0.95) - 1]
-        : 0;
+      const rowNumber = i + 2;
 
-    const serviceMap = new Map<
-      string,
-      {
-        id: string;
-        name: string;
-        total: number;
-        up: number;
-        down: number;
-        degraded: number;
-        latencies: number[];
+      if (!row.service_id) {
+        errors.push(`Row ${rowNumber}: missing service_id`);
+        continue;
       }
-    >();
 
-    for (const check of checks) {
-      if (!serviceMap.has(check.serviceId)) {
-        serviceMap.set(check.serviceId, {
-          id: check.service.id,
-          name: check.service.name,
-          total: 0,
-          up: 0,
-          down: 0,
-          degraded: 0,
-          latencies: [],
+      if (!row.service_name) {
+        errors.push(`Row ${rowNumber}: missing service_name`);
+        continue;
+      }
+
+      if (!row.timestamp) {
+        errors.push(`Row ${rowNumber}: missing timestamp`);
+        continue;
+      }
+
+      if (!row.status_code) {
+        errors.push(`Row ${rowNumber}: missing status_code`);
+        continue;
+      }
+
+      if (!row.agent) {
+        errors.push(`Row ${rowNumber}: missing agent`);
+        continue;
+      }
+
+      if (!row.region) {
+        errors.push(`Row ${rowNumber}: missing region`);
+        continue;
+      }
+
+      const timestamp = new Date(row.timestamp);
+
+      if (Number.isNaN(timestamp.getTime())) {
+        errors.push(`Row ${rowNumber}: invalid timestamp`);
+        continue;
+      }
+
+      const statusCode = Number(row.status_code);
+
+      if (!Number.isInteger(statusCode) || statusCode < 100) {
+        errors.push(`Row ${rowNumber}: invalid status code`);
+        continue;
+      }
+
+      const latency = Number(row.latency);
+
+      const latencyMs = latencyToMs(latency, row.latency_unit ?? "ms");
+
+      if (latencyMs === null) {
+        errors.push(`Row ${rowNumber}: invalid latency`);
+        continue;
+      }
+
+      if (latencyMs < 0) {
+        errors.push(`Row ${rowNumber}: negative latency`);
+        continue;
+      }
+
+      const status = getCheckStatus(statusCode);
+
+      validChecks.push({
+        serviceId: row.service_id.trim(),
+        serviceName: row.service_name.trim(),
+        timestamp,
+        statusCode,
+        latencyMs,
+        status,
+        agent: row.agent.trim(),
+        region: row.region.trim(),
+      });
+    }
+
+    if (validChecks.length === 0) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "No valid records found",
+          totalRows: rows.length,
+          invalidRows: errors.length,
+          errors,
+        },
+        { status: 400 },
+      );
+    }
+
+    const uploadId = crypto.randomUUID();
+
+    await prisma.$transaction(
+      async (tx) => {
+        const services = new Map<string, string>();
+
+        for (const check of validChecks) {
+          services.set(check.serviceId, check.serviceName);
+        }
+
+        for (const [serviceId, serviceName] of services) {
+          await tx.service.upsert({
+            where: {
+              id: serviceId,
+            },
+            update: {
+              name: serviceName,
+            },
+            create: {
+              id: serviceId,
+              name: serviceName,
+            },
+          });
+        }
+
+        await tx.monitoringCheck.createMany({
+          data: validChecks.map((check) => ({
+            serviceId: check.serviceId,
+            timestamp: check.timestamp,
+            statusCode: check.statusCode,
+            latencyMs: check.latencyMs,
+            status: check.status,
+            agent: check.agent,
+            region: check.region,
+          })),
         });
-      }
 
-      const service = serviceMap.get(check.serviceId)!;
+        const checksByService = new Map<string, typeof validChecks>();
 
-      service.total++;
+        for (const check of validChecks) {
+          if (!checksByService.has(check.serviceId)) {
+            checksByService.set(check.serviceId, []);
+          }
 
-      if (check.status === "UP") {
-        service.up++;
-      }
+          checksByService.get(check.serviceId)!.push(check);
+        }
 
-      if (check.status === "DOWN") {
-        service.down++;
-      }
+        for (const [serviceId, serviceChecks] of checksByService) {
+          const sortedChecks = [...serviceChecks].sort(
+            (a, b) => a.timestamp.getTime() - b.timestamp.getTime(),
+          );
 
-      if (check.status === "DEGRADED") {
-        service.degraded++;
-      }
+          let incidentStart: Date | null = null;
 
-      if (check.latencyMs !== null) {
-        service.latencies.push(check.latencyMs);
-      }
-    }
+          for (let i = 0; i < sortedChecks.length; i++) {
+            const check = sortedChecks[i];
 
-    const services = Array.from(serviceMap.values()).map((service) => {
-      const sortedLatencies = service.latencies.sort((a, b) => a - b);
+            if (check.status === "DOWN") {
+              if (!incidentStart) {
+                incidentStart = check.timestamp;
+              }
 
-      const avgLatency =
-        sortedLatencies.length > 0
-          ? sortedLatencies.reduce((sum, value) => sum + value, 0) /
-            sortedLatencies.length
-          : 0;
+              continue;
+            }
 
-      const p95 =
-        sortedLatencies.length > 0
-          ? sortedLatencies[Math.ceil(sortedLatencies.length * 0.95) - 1]
-          : 0;
+            if (incidentStart) {
+              const resolvedAt = check.timestamp;
 
-      return {
-        id: service.id,
-        name: service.name,
+              const durationMin = Math.max(
+                0,
+                Math.round(
+                  (resolvedAt.getTime() - incidentStart.getTime()) / 60000,
+                ),
+              );
 
-        totalChecks: service.total,
-        successfulChecks: service.up,
-        failedChecks: service.down,
-        degradedChecks: service.degraded,
+              const downCount = sortedChecks.filter(
+                (c) =>
+                  c.timestamp >= incidentStart! &&
+                  c.timestamp <= resolvedAt &&
+                  c.status === "DOWN",
+              ).length;
 
-        availability:
-          service.total > 0 ? (service.up / service.total) * 100 : 0,
+              let severity: Severity;
 
-        averageLatency: Number(avgLatency.toFixed(2)),
-        p95Latency: Number(p95.toFixed(2)),
-      };
-    });
+              if (durationMin >= 60 || downCount >= 5) {
+                severity = "CRITICAL";
+              } else if (durationMin >= 30 || downCount >= 3) {
+                severity = "HIGH";
+              } else if (durationMin >= 15 || downCount >= 2) {
+                severity = "MEDIUM";
+              } else {
+                severity = "LOW";
+              }
 
-    const incidentWhere: any = {};
+              await tx.incident.create({
+                data: {
+                  serviceId,
+                  startedAt: incidentStart,
+                  resolvedAt,
+                  status: "RESOLVED",
+                  severity,
+                  durationMin,
+                },
+              });
 
-    if (from || to) {
-      incidentWhere.startedAt = {};
+              incidentStart = null;
+            }
+          }
+          if (incidentStart) {
+            const lastCheck = sortedChecks[sortedChecks.length - 1];
 
-      if (from) {
-        incidentWhere.startedAt.gte = new Date(`${from}T00:00:00.000Z`);
-      }
+            const durationMin = Math.max(
+              0,
+              Math.round(
+                (lastCheck.timestamp.getTime() - incidentStart.getTime()) /
+                  60000,
+              ),
+            );
 
-      if (to) {
-        incidentWhere.startedAt.lte = new Date(`${to}T23:59:59.999Z`);
-      }
-    }
+            const downCount = sortedChecks.filter(
+              (c) => c.timestamp >= incidentStart! && c.status === "DOWN",
+            ).length;
 
-    const incidents = await prisma.incident.findMany({
-      where: incidentWhere,
+            let severity: Severity;
 
-      select: {
-        id: true,
-        serviceId: true,
-        startedAt: true,
-        resolvedAt: true,
-        status: true,
-        severity: true,
-        durationMin: true,
+            if (durationMin >= 60 || downCount >= 5) {
+              severity = "CRITICAL";
+            } else if (durationMin >= 30 || downCount >= 3) {
+              severity = "HIGH";
+            } else if (durationMin >= 15 || downCount >= 2) {
+              severity = "MEDIUM";
+            } else {
+              severity = "LOW";
+            }
+
+            await tx.incident.create({
+              data: {
+                serviceId,
+                startedAt: incidentStart,
+                resolvedAt: null,
+                status: "OPEN",
+                severity,
+                durationMin,
+              },
+            });
+          }
+        }
       },
-    });
-
-    const totalDowntime = incidents.reduce(
-      (total, incident) => total + (incident.durationMin ?? 0),
-      0,
+      {
+        timeout: 60000,
+      },
     );
 
     return NextResponse.json({
       success: true,
+      uploadId,
 
-      overview: {
-        totalChecks,
-        successfulChecks,
-        failedChecks,
-        degradedChecks,
-        unknownChecks,
-
-        availability: Number(availability.toFixed(3)),
-
-        averageLatency: Number(averageLatency.toFixed(2)),
-
-        p95Latency: Number(p95Latency.toFixed(2)),
-
-        incidentCount: incidents.length,
-
-        totalDowntimeMinutes: totalDowntime,
+      summary: {
+        totalRows: rows.length,
+        insertedRows: validChecks.length,
+        rejectedRows: errors.length,
+        services: new Set(validChecks.map((check) => check.serviceId)).size,
       },
 
-      services,
-
-      incidents,
+      errors,
     });
   } catch (error) {
-    console.error("Failed to calculate stats:", error);
+    console.error("CSV upload failed:", error);
 
     return NextResponse.json(
       {
         success: false,
-        error: "Failed to calculate statistics",
+        error: "Failed to process CSV",
       },
       { status: 500 },
     );
