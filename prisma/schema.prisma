@@ -1,0 +1,84 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum IncidentStatus {
+  OPEN
+  RESOLVED
+}
+
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum CheckStatus {
+  UP
+  DOWN
+  DEGRADED
+  UNKNOWN
+}
+
+model Service {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  description String?
+  slaTarget   Float   @default(99.9)
+
+  checks    MonitoringCheck[]
+  incidents Incident[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([name])
+}
+
+model MonitoringCheck {
+  id        String  @id @default(cuid())
+  serviceId String
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  timestamp      DateTime
+  status         CheckStatus
+  responseTimeMs Int?
+  statusCode     Int?
+  endpoint       String?
+
+  createdAt DateTime @default(now())
+
+  @@index([serviceId])
+  @@index([timestamp])
+  @@index([serviceId, timestamp])
+}
+
+model Incident {
+  id        String  @id @default(cuid())
+  serviceId String
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+
+  severity Severity
+  status   IncidentStatus @default(OPEN)
+
+  startedAt  DateTime
+  resolvedAt DateTime?
+  durationMs Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([serviceId])
+  @@index([startedAt])
+  @@index([status])
+  @@index([severity])
+}
