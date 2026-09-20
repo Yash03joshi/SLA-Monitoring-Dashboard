@@ -27,58 +27,56 @@ enum CheckStatus {
 }
 
 model Service {
-  id          String  @id @default(cuid())
-  name        String  @unique
-  description String?
-  slaTarget   Float   @default(99.9)
+  id        String   @id
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   checks    MonitoringCheck[]
   incidents Incident[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
 
   @@index([name])
 }
 
 model MonitoringCheck {
-  id        String  @id @default(cuid())
+  id String @id @default(cuid())
+
   serviceId String
   service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
 
-  timestamp      DateTime
-  status         CheckStatus
-  responseTimeMs Int?
-  statusCode     Int?
-  endpoint       String?
+  timestamp  DateTime
+  statusCode Int
+  latencyMs  Float?
+  status     CheckStatus
+
+  agent  String
+  region String
 
   createdAt DateTime @default(now())
 
-  @@index([serviceId])
-  @@index([timestamp])
   @@index([serviceId, timestamp])
+  @@index([timestamp])
+  @@index([status])
+  @@index([region])
 }
 
 model Incident {
-  id        String  @id @default(cuid())
+  id String @id @default(cuid())
+
   serviceId String
   service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
 
-  title       String
-  description String?
-
-  severity Severity
-  status   IncidentStatus @default(OPEN)
-
   startedAt  DateTime
   resolvedAt DateTime?
-  durationMs Int?
+
+  status   IncidentStatus @default(OPEN)
+  severity Severity
+
+  durationMin Int?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@index([serviceId])
-  @@index([startedAt])
+  @@index([serviceId, startedAt])
   @@index([status])
-  @@index([severity])
 }
